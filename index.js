@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Client, Databases, Storage, ID, InputFile } = require('node-appwrite');
-const ytdl = require('@distube/ytdl-core'); // Fallback library
+const ytdl = require('@distube/ytdl-core');
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -25,17 +25,16 @@ const BUCKET_ID = '692c5892002418619aff';
 const DB_ID = '692c530f0031554a340b';
 const COL_ID = 'songs';
 
-// --- ROBUST SERVER LIST ---
+// --- UPDATED SERVER LIST (Fresh Mirrors) ---
 const INSTANCES = [
-    'https://api.cobalt.tools/api/json',
-    'https://cobalt.kwiatekmiki.pl/api/json',
+    'https://cobalt.kwiatekmiki.pl/api/json', // Usually reliable
+    'https://api.cobalt.tools/api/json',      // Official (Strict)
     'https://cobalt.lacey.se/api/json',
     'https://cobalt.synced.is/api/json',
-    'https://cobalt.adminforge.de/api/json',
     'https://cobalt.rudart.cn/api/json'
 ];
 
-app.get('/', (req, res) => res.send('RedVibes Ultimate Server is Running!'));
+app.get('/', (req, res) => res.send('RedVibes Android-Mode Server is Running!'));
 
 app.get('/upload-youtube', async (req, res) => {
     const videoUrl = req.query.url;
@@ -47,7 +46,7 @@ app.get('/upload-youtube', async (req, res) => {
 
     console.log(`[START] Processing: ${videoUrl}`);
 
-    // STRATEGY A: Try Public Cobalt APIs
+    // STRATEGY A: Cobalt APIs
     for (const apiBase of INSTANCES) {
         if (success) break;
         try {
@@ -57,43 +56,60 @@ app.get('/upload-youtube', async (req, res) => {
                 downloadMode: "audio",
                 audioFormat: "mp3"
             }, { 
-                headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-                timeout: 10000 
+                headers: { 'Accept': 'application/json' },
+                timeout: 8000 
             });
 
             const streamUrl = cobalt.data.url || (cobalt.data.picker ? cobalt.data.picker[0].url : null);
             
             if (streamUrl) {
-                console.log("Got URL, downloading...");
-                const audioRes = await axios.get(streamUrl, { responseType: 'arraybuffer', timeout: 20000 });
+                const audioRes = await axios.get(streamUrl, { responseType: 'arraybuffer', timeout: 15000 });
                 buffer = Buffer.from(audioRes.data);
                 if(cobalt.data.filename) title = cobalt.data.filename.replace('.mp3', '');
                 success = true;
+                console.log(`✅ Success via API`);
             }
         } catch (e) {
-            console.log(`Failed ${apiBase}: ${e.message}`);
+            console.log(`Failed ${apiBase}`);
         }
     }
 
-    // STRATEGY B: Fallback to Local Downloader (If APIs fail)
+    // STRATEGY B: Local Downloader with ANDROID CLOAKING
     if (!success) {
-        console.log("⚠️ APIs failed. Trying Local Backup...");
+        console.log("⚠️ APIs failed. Engaging Android Mode...");
         try {
-            if (!ytdl.validateURL(videoUrl)) throw new Error("Invalid URL");
+            // This tricks YouTube into thinking we are an Android App, not a server
+            const agent = ytdl.createAgent([{ name: 'cookie', value: '' }]); 
             
-            const info = await ytdl.getInfo(videoUrl);
+            const info = await ytdl.getInfo(videoUrl, { 
+                agent,
+                playerClients: ["ANDROID", "WEB_CREATOR"] // Use Android Client
+            });
+            
             title = info.videoDetails.title;
             
-            const stream = ytdl(videoUrl, { quality: 'highestaudio', filter: 'audioonly' });
+            const stream = ytdl(videoUrl, { 
+                quality: 'highestaudio', 
+                filter: 'audioonly',
+                agent,
+                playerClients: ["ANDROID", "WEB_CREATOR"]
+            });
+
             const chunks = [];
             for await (const chunk of stream) chunks.push(chunk);
             buffer = Buffer.concat(chunks);
             success = true;
-            console.log("✅ Local Backup Success!");
+            console.log("✅ Local Android Mode Success!");
         } catch (e) {
-            console.error("Local Backup Failed:", e.message);
-            return res.status(500).json({ error: "All methods failed. Video might be restricted." });
+            console.error("Local Error:", e.message);
+            // Don't quit yet, return specific error
+            if(e.message.includes('403')) return res.status(500).json({ error: "Server IP is blocked by YouTube (403)." });
+            if(e.message.includes('410')) return res.status(500).json({ error: "Video is Age Restricted or Deleted." });
         }
+    }
+
+    if (!success || !buffer) {
+        return res.status(500).json({ error: "All download methods failed." });
     }
 
     // UPLOAD TO APPWRITE
@@ -101,7 +117,7 @@ app.get('/upload-youtube', async (req, res) => {
         const cleanTitle = title.replace(/[^\w\s-]/gi, '').trim();
         const filename = `${cleanTitle}.mp3`;
         
-        console.log(`Uploading ${filename} to Appwrite...`);
+        console.log(`Uploading ${filename}...`);
         const fileId = ID.unique();
         
         const fileRes = await storage.createFile(
@@ -125,12 +141,11 @@ app.get('/upload-youtube', async (req, res) => {
             url: publicUrl
         });
 
-        console.log('Done!');
         res.json({ success: true, message: 'Uploaded!' });
 
     } catch (error) {
         console.error("Upload Error:", error);
-        res.status(500).json({ error: "Upload to Cloud failed." });
+        res.status(500).json({ error: "Appwrite Upload Failed: " + error.message });
     }
 });
 
