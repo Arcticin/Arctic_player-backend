@@ -2,14 +2,15 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Client, Databases, Storage, ID, InputFile } = require('node-appwrite');
+const ytdl = require('@distube/ytdl-core'); // Fallback library
 
 const app = express();
 app.use(cors({ origin: '*' }));
 
-// --- 🔴 SERVER CONFIGURATION 🔴 ---
+// --- 🔴 CONFIGURATION 🔴 ---
 const client = new Client();
 
-// API SECRET KEY
+// 1. PASTE YOUR API SECRET KEY HERE
 const API_KEY = 'standard_c5809a7931f0429ba74ebbbbd219ef80f9719fe772a1ec656a47c9e6268d5ed9c5bd466b4f1f15a650a7dda355cf34b45659cefbb2932cfc383eb55d8cc7ff32eb4120fe51b39031d90f3d1b877d1440d384b7d82e9a06dced07ec2f2070698b16877e050cb1f48357a5475f8ab390aff2dd4806bbabe030a163e4dd0f1d1f16';
 
 client
@@ -24,95 +25,112 @@ const BUCKET_ID = '692c5892002418619aff';
 const DB_ID = '692c530f0031554a340b';
 const COL_ID = 'songs';
 
-// --- LIST OF PUBLIC SERVERS (Backups) ---
+// --- ROBUST SERVER LIST ---
 const INSTANCES = [
-    'https://api.cobalt.tools/api/json',      // Main (Official)
-    'https://cobalt.kwiatekmiki.pl/api/json', // Backup 1
-    'https://cobalt.lacey.se/api/json',       // Backup 2
-    'https://cobalt.smartcode.nl/api/json'    // Backup 3
+    'https://api.cobalt.tools/api/json',
+    'https://cobalt.kwiatekmiki.pl/api/json',
+    'https://cobalt.lacey.se/api/json',
+    'https://cobalt.synced.is/api/json',
+    'https://cobalt.adminforge.de/api/json',
+    'https://cobalt.rudart.cn/api/json'
 ];
 
-app.get('/', (req, res) => res.send('RedVibes Server (Multi-Instance) is Running!'));
+app.get('/', (req, res) => res.send('RedVibes Ultimate Server is Running!'));
 
 app.get('/upload-youtube', async (req, res) => {
     const videoUrl = req.query.url;
     if (!videoUrl) return res.status(400).json({ error: 'No URL provided' });
 
-    let streamUrl = null;
+    let buffer = null;
     let title = "YouTube Import";
-    let lastError = null;
+    let success = false;
 
-    // 1. Try servers one by one until success
     console.log(`[START] Processing: ${videoUrl}`);
-    
+
+    // STRATEGY A: Try Public Cobalt APIs
     for (const apiBase of INSTANCES) {
+        if (success) break;
         try {
-            console.log(`Trying server: ${apiBase} ...`);
-            
-            const cobaltResponse = await axios.post(apiBase, {
+            console.log(`Trying API: ${apiBase}...`);
+            const cobalt = await axios.post(apiBase, {
                 url: videoUrl,
                 downloadMode: "audio",
-                audioFormat: "mp3",
-                filenamePattern: "basic"
-            }, {
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
-                },
-                timeout: 15000 // 15s timeout per server
+                audioFormat: "mp3"
+            }, { 
+                headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                timeout: 10000 
             });
 
-            if (cobaltResponse.data && (cobaltResponse.data.url || cobaltResponse.data.picker)) {
-                streamUrl = cobaltResponse.data.url || cobaltResponse.data.picker[0].url;
-                if (cobaltResponse.data.filename) title = cobaltResponse.data.filename.replace('.mp3', '');
-                console.log(`✅ Success with ${apiBase}`);
-                break; // Stop loop if it works
+            const streamUrl = cobalt.data.url || (cobalt.data.picker ? cobalt.data.picker[0].url : null);
+            
+            if (streamUrl) {
+                console.log("Got URL, downloading...");
+                const audioRes = await axios.get(streamUrl, { responseType: 'arraybuffer', timeout: 20000 });
+                buffer = Buffer.from(audioRes.data);
+                if(cobalt.data.filename) title = cobalt.data.filename.replace('.mp3', '');
+                success = true;
             }
         } catch (e) {
-            console.error(`❌ Failed on ${apiBase}: ${e.message}`);
-            lastError = e.message;
+            console.log(`Failed ${apiBase}: ${e.message}`);
         }
     }
 
-    if (!streamUrl) {
-        return res.status(500).json({ error: "All servers failed. Please try again later." });
+    // STRATEGY B: Fallback to Local Downloader (If APIs fail)
+    if (!success) {
+        console.log("⚠️ APIs failed. Trying Local Backup...");
+        try {
+            if (!ytdl.validateURL(videoUrl)) throw new Error("Invalid URL");
+            
+            const info = await ytdl.getInfo(videoUrl);
+            title = info.videoDetails.title;
+            
+            const stream = ytdl(videoUrl, { quality: 'highestaudio', filter: 'audioonly' });
+            const chunks = [];
+            for await (const chunk of stream) chunks.push(chunk);
+            buffer = Buffer.concat(chunks);
+            success = true;
+            console.log("✅ Local Backup Success!");
+        } catch (e) {
+            console.error("Local Backup Failed:", e.message);
+            return res.status(500).json({ error: "All methods failed. Video might be restricted." });
+        }
     }
 
+    // UPLOAD TO APPWRITE
     try {
-        // 2. Download the Audio
-        console.log("Downloading audio stream...");
-        const audioResponse = await axios.get(streamUrl, { 
-            responseType: 'arraybuffer',
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        const buffer = Buffer.from(audioResponse.data);
-
-        // 3. Upload to Appwrite
-        const filename = `${title.replace(/[^\w\s-]/gi, '')}_${Date.now()}.mp3`;
-        console.log(`Uploading ${filename} (${buffer.length} bytes)...`);
+        const cleanTitle = title.replace(/[^\w\s-]/gi, '').trim();
+        const filename = `${cleanTitle}.mp3`;
         
+        console.log(`Uploading ${filename} to Appwrite...`);
         const fileId = ID.unique();
-        const fileRes = await storage.createFile(BUCKET_ID, fileId, InputFile.fromBuffer(buffer, filename));
+        
+        const fileRes = await storage.createFile(
+            BUCKET_ID, 
+            fileId, 
+            InputFile.fromBuffer(buffer, filename)
+        );
 
-        // 4. Save to DB
         const publicUrl = `https://sgp.cloud.appwrite.io/v1/storage/buckets/${BUCKET_ID}/files/${fileRes.$id}/view?project=692c52a50008e44bd725`;
         
         let artist = "YouTube";
-        if (title.includes('-')) {
-            const parts = title.split('-');
+        if (cleanTitle.includes('-')) {
+            const parts = cleanTitle.split('-');
             artist = parts[0].trim();
             title = parts.slice(1).join('-').trim();
         }
 
-        await db.createDocument(DB_ID, COL_ID, ID.unique(), { title, artist, url: publicUrl });
+        await db.createDocument(DB_ID, COL_ID, ID.unique(), {
+            title: title || cleanTitle,
+            artist: artist,
+            url: publicUrl
+        });
 
-        console.log('[DONE] Upload complete!');
-        res.json({ success: true, message: 'Uploaded successfully!' });
+        console.log('Done!');
+        res.json({ success: true, message: 'Uploaded!' });
 
     } catch (error) {
-        console.error("[FINAL ERROR]", error);
-        res.status(500).json({ error: "Upload failed during file transfer." });
+        console.error("Upload Error:", error);
+        res.status(500).json({ error: "Upload to Cloud failed." });
     }
 });
 
